@@ -513,6 +513,133 @@ def run_load_checkpoint(
     raise NotImplementedError
 
 
+from typing import List, Tuple, Dict, Optional, Iterable, Iterator
+import itertools
+
+class Tokenizer:
+    def __init__(self, vocab: Dict[int, bytes], merges: List[Tuple[bytes, bytes]], special_tokens: Optional[List[str]] = None):
+        """
+        Initialize the Tokenizer with a vocabulary, list of merges, and optional special tokens.
+        
+        :param vocab: Dictionary mapping integer IDs to byte sequences.
+        :param merges: List of tuples representing byte pair merges.
+        :param special_tokens: List of special tokens as strings.
+        """
+        self.vocab: Dict[int, bytes] = vocab.copy()
+        self.merges: List[Tuple[bytes, bytes]] = merges.copy()
+        self.reverse_vocab: Dict[bytes, int] = {v: k for k, v in self.vocab.items()}
+        self.next_id: int = max(self.vocab.keys()) + 1 if self.vocab else 0
+
+        if special_tokens:
+            for token in special_tokens:
+                token_bytes = token.encode('utf-8')
+                if token_bytes not in self.reverse_vocab:
+                    self.vocab[self.next_id] = token_bytes
+                    self.reverse_vocab[token_bytes] = self.next_id
+                    self.next_id += 1
+
+    @classmethod
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: Optional[List[str]] = None):
+        """
+        Class method to construct a Tokenizer from vocabulary and merges files.
+        
+        :param vocab_filepath: Path to the vocabulary file.
+        :param merges_filepath: Path to the merges file.
+        :param special_tokens: List of special tokens as strings.
+        :return: An instance of Tokenizer.
+        """
+        vocab = {}
+        with open(vocab_filepath, 'r', encoding='utf-8') as vf:
+            for line in vf:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(' ', 1)
+                if len(parts) != 2:
+                    raise ValueError(f"Invalid vocab line: {line}")
+                id_str, byte_str = parts
+                try:
+                    id_int = int(id_str)
+                except ValueError:
+                    raise ValueError(f"Invalid ID in vocab line: {line}")
+                byte_seq = byte_str.encode('utf-8').decode('unicode_escape').encode('latin1')
+                vocab[id_int] = byte_seq
+
+        merges = []
+        with open(merges_filepath, 'r', encoding='utf-8') as mf:
+            for line in mf:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue  # Skip comments or empty lines
+                parts = line.split()
+                if len(parts) != 2:
+                    raise ValueError(f"Invalid merge line: {line}")
+                first, second = parts
+                first_bytes = first.encode('utf-8').decode('unicode_escape').encode('latin1')
+                second_bytes = second.encode('utf-8').decode('unicode_escape').encode('latin1')
+                merges.append((first_bytes, second_bytes))
+
+        return cls(vocab, merges, special_tokens)
+
+    def encode(self, text: str) -> List[int]:
+        """
+        Encode an input text into a sequence of token IDs.
+        
+        :param text: The input string to encode.
+        :return: List of integer token IDs.
+        """
+        # Convert text to bytes
+        text_bytes = text.encode('utf-8')
+        # Initialize tokens as list of bytes
+        tokens = list(text_bytes)
+        tokens = [[bytes([b])] for b in tokens]  # List of single-byte bytes objects
+
+        # Apply merges
+        for merge in self.merges:
+            first, second = merge
+            i = 0
+            while i < len(tokens) - 1:
+                if tokens[i] == first and tokens[i + 1] == second:
+                    # Merge tokens[i] and tokens[i+1]
+                    tokens[i:i + 2] = [first + second]
+                    # After merging, stay at the same index to check for overlapping merges
+                    if i > 0:
+                        i -= 1
+                else:
+                    i += 1
+
+        # Map tokens to IDs
+        token_ids = []
+        for token in tokens:
+            if token in self.reverse_vocab:
+                token_ids.append(self.reverse_vocab[token])
+            else:
+                raise ValueError(f"Token {token} not found in vocabulary.")
+
+        return token_ids
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        """
+        Given an iterable of strings, lazily yield token IDs.
+        
+        :param iterable: An iterable of strings.
+        :return: An iterator of integer token IDs.
+        """
+        for text in iterable:
+            token_ids = self.encode(text)
+            for tid in token_ids:
+                yield tid
+
+    def decode(self, ids: List[int]) -> str:
+        """
+        Decode a sequence of token IDs into text.
+        
+        :param ids: List of integer token IDs.
+        :return: The decoded string.
+        """
+        byte_seq = b''.join([self.vocab.get(id_, b'') for id_ in ids])
+        return byte_seq.decode('utf-8', errors='replace')
+
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
@@ -536,8 +663,8 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
-
+    tokenizer = Tokenizer(vocab=vocab, merges=merges, special_tokens=special_tokens)
+    return tokenizer
 
 import os
 import collections
