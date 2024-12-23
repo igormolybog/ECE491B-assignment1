@@ -513,132 +513,223 @@ def run_load_checkpoint(
     raise NotImplementedError
 
 
-from typing import List, Tuple, Dict, Optional, Iterable, Iterator
-import itertools
+import os
+import re
+from typing import Dict, List, Tuple, Optional, Iterable, Iterator
 
 class Tokenizer:
-    def __init__(self, vocab: Dict[int, bytes], merges: List[Tuple[bytes, bytes]], special_tokens: Optional[List[str]] = None):
-        """
-        Initialize the Tokenizer with a vocabulary, list of merges, and optional special tokens.
-        
-        :param vocab: Dictionary mapping integer IDs to byte sequences.
-        :param merges: List of tuples representing byte pair merges.
-        :param special_tokens: List of special tokens as strings.
-        """
-        self.vocab: Dict[int, bytes] = vocab.copy()
-        self.merges: List[Tuple[bytes, bytes]] = merges.copy()
-        self.reverse_vocab: Dict[bytes, int] = {v: k for k, v in self.vocab.items()}
-        self.next_id: int = max(self.vocab.keys()) + 1 if self.vocab else 0
+    """
+    A BPE Tokenizer that:
+    1) Loads a vocabulary (int -> bytes).
+    2) Loads a list of merges (pairs of bytes).
+    3) Supports adding and recognizing special tokens.
+    4) Can encode text to token IDs, preserving special tokens.
+    5) Can decode token IDs back into text.
+    6) Offers an iterative interface for encoding large streams.
+    """
 
-        if special_tokens:
-            for token in special_tokens:
-                token_bytes = token.encode('utf-8')
-                if token_bytes not in self.reverse_vocab:
-                    self.vocab[self.next_id] = token_bytes
-                    self.reverse_vocab[token_bytes] = self.next_id
+    def __init__(
+        self,
+        vocab: Dict[int, bytes],
+        merges: List[Tuple[bytes, bytes]],
+        special_tokens: Optional[List[str]] = None
+    ):
+        """
+        Construct a tokenizer from a given vocabulary, list of merges, and (optionally)
+        a list of special tokens.
+        
+        :param vocab: A dict mapping token ID (int) -> token string (as bytes).
+        :param merges: A list of merges, each a tuple of (b1, b2), where b1 and b2 are bytes.
+        :param special_tokens: Optional list of special tokens (strings). 
+        """
+
+        # Store the original vocab and merges
+        self.id_to_token = dict(vocab)  # int -> bytes
+        self.token_to_id = {v: k for k, v in self.id_to_token.items()}  # bytes -> int
+
+        # Build a ranking dictionary from merges for quick lookup
+        # merges[0] is the highest priority; merges[-1] is the lowest.
+        self.bpe_ranks = {
+            (pair[0], pair[1]): i for i, pair in enumerate(merges)
+        }
+
+        # Next available token ID (i.e., if we add special tokens not present in vocab)
+        self.next_id = max(self.id_to_token.keys()) + 1 if self.id_to_token else 0
+
+        # Initialize special tokens
+        self.special_tokens = special_tokens or []
+        self.special_tokens_bytes = [token.encode("utf-8") for token in self.special_tokens]
+
+        # Add special tokens to the vocabulary if needed
+        if self.special_tokens:
+            for token_str, token_bytes in zip(self.special_tokens, self.special_tokens_bytes):
+                if token_bytes not in self.token_to_id:
+                    # Assign a new ID, update both dicts
+                    self.id_to_token[self.next_id] = token_bytes
+                    self.token_to_id[token_bytes] = self.next_id
                     self.next_id += 1
 
+        # Compile regex pattern for special tokens
+        if self.special_tokens_bytes:
+            # Escape special characters in tokens for regex
+            escaped_tokens = [re.escape(token.decode("utf-8")) for token in self.special_tokens_bytes]
+            pattern = "(" + "|".join(escaped_tokens) + ")"
+            self.special_tokens_pattern = re.compile(pattern)
+        else:
+            self.special_tokens_pattern = None
+
     @classmethod
-    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: Optional[List[str]] = None):
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: Optional[List[str]] = None
+    ):
         """
-        Class method to construct a Tokenizer from vocabulary and merges files.
-        
-        :param vocab_filepath: Path to the vocabulary file.
-        :param merges_filepath: Path to the merges file.
-        :param special_tokens: List of special tokens as strings.
-        :return: An instance of Tokenizer.
+        Class method that constructs and returns a Tokenizer from a serialized vocabulary and
+        list of merges (in the same format that your BPE training code output),
+        optionally with a list of special tokens.
+
+        :param vocab_filepath: Path to the file containing serialized vocabulary.
+        :param merges_filepath: Path to the file containing serialized merges.
+        :param special_tokens: Optional list of special tokens.
         """
+        # Load vocab from file
+        # Here, we expect a file format where each line is "<token_id>\t<token_bytes>"
         vocab = {}
-        with open(vocab_filepath, 'r', encoding='utf-8') as vf:
+        with open(vocab_filepath, "r", encoding="utf-8") as vf:
             for line in vf:
                 line = line.strip()
                 if not line:
                     continue
-                parts = line.split(' ', 1)
+                parts = line.split("\t")
                 if len(parts) != 2:
-                    raise ValueError(f"Invalid vocab line: {line}")
-                id_str, byte_str = parts
-                try:
-                    id_int = int(id_str)
-                except ValueError:
-                    raise ValueError(f"Invalid ID in vocab line: {line}")
-                byte_seq = byte_str.encode('utf-8').decode('unicode_escape').encode('latin1')
-                vocab[id_int] = byte_seq
+                    raise ValueError(
+                        f"Invalid vocab line format: {line}. Expected <id>\\t<token_bytes>."
+                    )
+                token_id_str, token_str = parts
+                token_id = int(token_id_str)
+                # The token in file might be saved as a string; we convert it back to bytes
+                # Assuming the tokens are stored as their literal string representations
+                vocab[token_id] = token_str.encode("utf-8")
 
+        # Load merges from file
+        # We expect each line to contain "<b1> <b2>", separated by space
         merges = []
-        with open(merges_filepath, 'r', encoding='utf-8') as mf:
+        with open(merges_filepath, "r", encoding="utf-8") as mf:
             for line in mf:
                 line = line.strip()
-                if not line or line.startswith('#'):
-                    continue  # Skip comments or empty lines
+                if not line:
+                    continue
                 parts = line.split()
                 if len(parts) != 2:
-                    raise ValueError(f"Invalid merge line: {line}")
-                first, second = parts
-                first_bytes = first.encode('utf-8').decode('unicode_escape').encode('latin1')
-                second_bytes = second.encode('utf-8').decode('unicode_escape').encode('latin1')
-                merges.append((first_bytes, second_bytes))
+                    raise ValueError(
+                        f"Invalid merges line format: {line}. Expected two tokens."
+                    )
+                b1, b2 = parts
+                merges.append((b1.encode("utf-8"), b2.encode("utf-8")))
 
         return cls(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> List[int]:
         """
-        Encode an input text into a sequence of token IDs.
-        
-        :param text: The input string to encode.
-        :return: List of integer token IDs.
+        Encode an input string into a list of token IDs using BPE merges, preserving special tokens.
+
+        :param text: Input string to encode.
+        :return: A list of token IDs.
         """
-        # Convert text to bytes
-        text_bytes = text.encode('utf-8')
-        # Initialize tokens as list of bytes
-        tokens = list(text_bytes)
-        tokens = [[bytes([b])] for b in tokens]  # List of single-byte bytes objects
+        if self.special_tokens_pattern:
+            # Split text into segments: special tokens and regular text
+            segments = self.special_tokens_pattern.split(text)
+        else:
+            segments = [text]
 
-        # Apply merges
-        for merge in self.merges:
-            first, second = merge
-            i = 0
-            while i < len(tokens) - 1:
-                if tokens[i] == first and tokens[i + 1] == second:
-                    # Merge tokens[i] and tokens[i+1]
-                    tokens[i:i + 2] = [first + second]
-                    # After merging, stay at the same index to check for overlapping merges
-                    if i > 0:
-                        i -= 1
-                else:
-                    i += 1
-
-        # Map tokens to IDs
         token_ids = []
-        for token in tokens:
-            if token in self.reverse_vocab:
-                token_ids.append(self.reverse_vocab[token])
+        for segment in segments:
+            if segment in self.special_tokens:
+                # It's a special token
+                token_bytes = segment.encode("utf-8")
+                if token_bytes in self.token_to_id:
+                    token_id = self.token_to_id[token_bytes]
+                    token_ids.append(token_id)
+                else:
+                    raise ValueError(f"Special token not found in vocab: {segment}")
             else:
-                raise ValueError(f"Token {token} not found in vocabulary.")
+                # Regular text: apply BPE encoding
+                # Basic pre-tokenization: split into bytes
+                tokens = list(segment.encode("utf-8"))  # e.g., "Hello" -> [72, 101, 108, 108, 111]
+                tokens = [bytes([t]) for t in tokens]
+
+                # Now repeatedly apply BPE merges until no more merges can be applied
+                merges_applied = True
+                while merges_applied and len(tokens) > 1:
+                    merges_applied = False
+                    # We need to find all possible pairs and select the one with the highest priority (lowest rank)
+                    pairs = [(tokens[i], tokens[i+1]) for i in range(len(tokens) - 1)]
+                    # Find all pairs that are in the BPE ranks
+                    candidate_pairs = {pair: self.bpe_ranks[pair] for pair in pairs if pair in self.bpe_ranks}
+                    if not candidate_pairs:
+                        break
+                    # Select the pair with the lowest rank (highest priority)
+                    best_pair = min(candidate_pairs, key=candidate_pairs.get)
+                    best_pair_rank = candidate_pairs[best_pair]
+
+                    # Find the first occurrence of the best pair
+                    for i, pair in enumerate(pairs):
+                        if pair == best_pair:
+                            best_pair_index = i
+                            break
+
+                    # Merge the best pair
+                    merged_token = tokens[best_pair_index] + tokens[best_pair_index + 1]
+                    tokens = tokens[:best_pair_index] + [merged_token] + tokens[best_pair_index + 2:]
+                    merges_applied = True
+
+                # Convert tokens to IDs
+                for t in tokens:
+                    if t in self.token_to_id:
+                        token_ids.append(self.token_to_id[t])
+                    else:
+                        # Handle unknown tokens if needed (e.g., add to vocab or fallback)
+                        # For now, raise an error or use a designated <UNK> token
+                        raise ValueError(f"Unknown token encountered: {t}")
 
         return token_ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         """
-        Given an iterable of strings, lazily yield token IDs.
-        
+        Given an iterable of strings (e.g., lines from a file), yield token IDs
+        in a streaming fashion. Useful for memory-efficient tokenization of large files.
+
         :param iterable: An iterable of strings.
-        :return: An iterator of integer token IDs.
+        :return: A generator of token IDs.
         """
         for text in iterable:
-            token_ids = self.encode(text)
-            for tid in token_ids:
+            # For each text, encode to a list of IDs, then yield them
+            ids = self.encode(text)
+            for tid in ids:
                 yield tid
 
     def decode(self, ids: List[int]) -> str:
         """
-        Decode a sequence of token IDs into text.
-        
-        :param ids: List of integer token IDs.
+        Decode a list of token IDs into a string.
+
+        :param ids: A list of token IDs.
         :return: The decoded string.
         """
-        byte_seq = b''.join([self.vocab.get(id_, b'') for id_ in ids])
-        return byte_seq.decode('utf-8', errors='replace')
+        # Convert each ID to bytes
+        token_bytes_list = []
+        for tid in ids:
+            if tid not in self.id_to_token:
+                # Handle unknown IDs if needed
+                # For now, raise an error or use a placeholder
+                raise ValueError(f"Unknown token id encountered: {tid}")
+            token_bytes_list.append(self.id_to_token[tid])
+
+        # Concatenate them and decode to string
+        text = b"".join(token_bytes_list).decode("utf-8", errors="replace")
+        return text
+
 
 def get_tokenizer(
     vocab: dict[int, bytes],
