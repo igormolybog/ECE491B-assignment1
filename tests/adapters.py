@@ -539,34 +539,245 @@ def get_tokenizer(
     raise NotImplementedError
 
 
+import os
+import collections
+import regex as re
+
+# A (very simple) GPT-2–style pre-tokenization regex; you can also adapt it
+# if you want to mimic the exact behavior from tiktoken/pull/234:
+GPT2_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
 def run_train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
-    special_tokens: list[str],
+    special_tokens: list[str] = None,
+    use_gpt2_pretokenizer: bool = True,
     **kwargs,
 ):
-    """Given the path to an input corpus, run train a BPE tokenizer and
+    """
+    Given the path to an input corpus, train a BPE tokenizer and
     output its vocabulary and merges.
 
-    Args:
-        input_path: str | os.PathLike
-            Path to BPE tokenizer training data.
-        vocab_size: int
-            Total number of items in the tokenizer's vocabulary (including special tokens).
-        special_tokens: list[str]
-            A list of string special tokens to be added to the tokenizer vocabulary.
-            These strings will never be split into multiple tokens, and will always be
-            kept as a single token. If these special tokens occur in the `input_path`,
-            they are treated as any other string.
-
-    Returns:
-        Tuple of (vocab, merges):
-            vocab: dict[int, bytes]
-                The trained tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
-                to bytes (token bytes)
-            merges: list[tuple[bytes, bytes]]
-                BPE merges. Each list item is a tuple of bytes (<token1>, <token2>),
-                representing that <token1> was merged with <token2>.
-                Merges are ordered by order of creation.
+    This version is optimized to avoid re-counting the entire dataset
+    after each merge; it incrementally updates pair frequencies.
     """
-    raise NotImplementedError
+    if special_tokens is None:
+        special_tokens = []
+
+    # ----------------------------------------------------------------
+    # 1. Read training data
+    # ----------------------------------------------------------------
+    with open(input_path, "r", encoding="utf-8") as f:
+        text = f.read()
+
+    # ----------------------------------------------------------------
+    # 2. Pre-tokenization
+    # ----------------------------------------------------------------
+    if use_gpt2_pretokenizer:
+        pre_tokens = re.findall(GPT2_PAT, text)
+    else:
+        pre_tokens = text.split()
+
+    # Filter out empty tokens
+    pre_tokens = [pt for pt in pre_tokens if pt.strip()]
+
+    # Convert each pre-token to a tuple of its bytes
+    # Example: "hello" -> (b'h', b'e', b'l', b'l', b'o')
+    token_sequences = []
+    for pt in pre_tokens:
+        pt_bytes = pt.encode("utf-8", errors="replace")
+        token_sequences.append(
+            tuple(bytes([b]) for b in pt_bytes)
+        )
+
+    # ----------------------------------------------------------------
+    # 3. Build initial frequency table (Counter) of these byte sequences
+    # ----------------------------------------------------------------
+    freq = collections.Counter(token_sequences)
+
+    # ----------------------------------------------------------------
+    # 4. Initialize the base vocabulary
+    # ----------------------------------------------------------------
+    vocab = {}
+    current_id = 0
+
+    # Add special tokens to vocab
+    for sptok in special_tokens:
+        vocab[current_id] = sptok.encode("utf-8")
+        current_id += 1
+
+    # Add 256 possible single-byte tokens
+    for b in range(256):
+        vocab[current_id] = bytes([b])
+        current_id += 1
+
+    # The final vocabulary size = #special_tokens + 256 + #merges
+    max_num_merges = vocab_size - (len(special_tokens) + 256)
+    if max_num_merges < 0:
+        max_num_merges = 0  # Edge case: no merges if vocab_size is too small
+
+    merges = []
+
+    # ----------------------------------------------------------------
+    # 5. Prepare for incremental BPE training
+    # ----------------------------------------------------------------
+    list_of_lists = []
+
+    # convert each unique token_tuple -> a list, keep track of freq
+    unique_sequences = sorted(freq.keys())  # just to have a stable ordering
+    for seq_id, token_tuple in enumerate(unique_sequences):
+        # convert the tuple into a list
+        list_of_lists.append(list(token_tuple))
+
+    # pair_counts: how many times does each pair appear across all sequences,
+    # weighted by freq[that sequence].
+    pair_counts = collections.Counter()
+
+    # pair_positions: maps (pair) -> list of (seq_id, position)
+    # position means index in the list_of_lists[seq_id]
+    pair_positions = collections.defaultdict(list)
+
+    def add_pair(pair, seq_id, pos, count=1):
+        """
+        Increment pair_counts[pair] by (freq of that sequence * count).
+        Also append (seq_id, pos) to pair_positions[pair].
+        """
+        seq_tuple = unique_sequences[seq_id]
+        pair_counts[pair] += freq[seq_tuple] * count
+        # We only append the position once; no need to multiply by freq
+        # because we store positions in a single representative sequence.
+        if count > 0:
+            pair_positions[pair].append((seq_id, pos))
+
+    # Build pair_counts and pair_positions from scratch
+    for seq_id, token_list in enumerate(list_of_lists):
+        seq_len = len(token_list)
+        for i in range(seq_len - 1):
+            pair = (token_list[i], token_list[i+1])
+            add_pair(pair, seq_id, i)
+
+    # ----------------------------------------------------------------
+    # 6. BPE Training Loop
+    # ----------------------------------------------------------------
+
+    def merge_sequence_pair(seq_id, pair, new_symbol):
+        """
+        In the token list for seq_id, merge consecutive tokens that match `pair`
+        into `new_symbol`. Then update pair_counts/pair_positions incrementally.
+        """
+        old_list = list_of_lists[seq_id]
+        p1, p2 = pair
+        i = 0
+        merged_list = []
+        length = len(old_list)
+
+        while i < length:
+            if i < length - 1 and (old_list[i], old_list[i+1]) == (p1, p2):
+                # We will merge old_list[i] and old_list[i+1]
+                merged_list.append(new_symbol)
+                i += 2
+            else:
+                merged_list.append(old_list[i])
+                i += 1
+
+        # Now we have the new merged list
+        list_of_lists[seq_id] = merged_list
+
+    #   (1) For every sequence, if it has occurrences of `pair`, remove that entire 
+    #       sequence's pairs from pair_counts (and pair_positions).
+    #   (2) Perform the merges for that sequence. 
+    #   (3) Re-add all pairs in the new sequence to pair_counts (and pair_positions).
+
+    def remove_sequence_pairs(seq_id):
+        """
+        Remove from pair_counts/pair_positions all pair occurrences of list_of_lists[seq_id].
+        """
+        seq_tuple = unique_sequences[seq_id]
+        seq_freq = freq[seq_tuple]
+        old_list = list_of_lists[seq_id]
+        for i in range(len(old_list) - 1):
+            old_pair = (old_list[i], old_list[i+1])
+            # Decrement
+            pair_counts[old_pair] -= seq_freq
+            if pair_counts[old_pair] <= 0:
+                del pair_counts[old_pair]
+                del pair_positions[old_pair]
+            else:
+                # we also remove the exact occurrence (seq_id, i) from pair_positions[old_pair]
+                positions = pair_positions[old_pair]
+                # remove (seq_id, i) from positions
+                # typically we do a linear search, which might be slow, but it's simpler
+                # and "exactly equivalent"
+                # If you'd like faster removal, you can keep a specialized data structure.
+                new_positions = []
+                removed_once = False
+                for (s_id, pos) in positions:
+                    if not removed_once and s_id == seq_id and pos == i:
+                        removed_once = True
+                    else:
+                        new_positions.append((s_id, pos))
+                pair_positions[old_pair] = new_positions
+
+    def add_sequence_pairs(seq_id):
+        """
+        Add all pair occurrences of list_of_lists[seq_id] to pair_counts/pair_positions.
+        """
+        seq_tuple = unique_sequences[seq_id]
+        seq_freq = freq[seq_tuple]
+        new_list = list_of_lists[seq_id]
+        for i in range(len(new_list) - 1):
+            new_pair = (new_list[i], new_list[i+1])
+            pair_counts[new_pair] += seq_freq
+            pair_positions[new_pair].append((seq_id, i))
+
+    # We'll store a copy of the old version of list_of_lists to do removal from pair_counts
+    # and pair_positions. Then we re-add for the new version.
+
+    for _ in range(max_num_merges):
+        # (a) If no pairs left, break
+        if not pair_counts:
+            break
+
+        # (b) Pick the most frequent pair (tie => lexicographically largest)
+        most_frequent_pair, highest_count = max(
+            pair_counts.items(), 
+            key=lambda x: (x[1], x[0])
+        )
+        if highest_count < 1:
+            break  # no more merges beneficial
+
+        merges.append(most_frequent_pair)
+        new_symbol = most_frequent_pair[0] + most_frequent_pair[1]
+
+        # (c) For every sequence that has this pair, we do a merge
+        # We gather a unique set of seq_ids from pair_positions
+        affected_positions = pair_positions.get(most_frequent_pair, [])
+        if not affected_positions:
+            # If no positions exist, just skip
+            continue
+
+        affected_seq_ids = set(seq_id for (seq_id, pos) in affected_positions)
+
+        # We'll do removal -> merge -> re-add for each affected seq_id
+        for seq_id in affected_seq_ids:
+            # remove old pairs from pair_counts
+            remove_sequence_pairs(seq_id)
+
+            # merge
+            merge_sequence_pair(seq_id, most_frequent_pair, new_symbol)
+
+            # re-add pairs in the updated sequence
+            add_sequence_pairs(seq_id)
+
+        # We also add new_symbol to vocab
+        vocab[current_id] = new_symbol
+        current_id += 1
+
+        # If we've reached max merges, stop
+        if len(merges) >= max_num_merges:
+            break
+
+    # ----------------------------------------------------------------
+    # 7. Return the final vocab and merges
+    # ----------------------------------------------------------------
+    return vocab, merges
