@@ -571,8 +571,12 @@ class Tokenizer:
 
         # Compile regex pattern for special tokens
         if self.special_tokens_bytes:
+            # Sort special tokens by length in descending order to handle overlapping tokens
+            sorted_tokens = sorted(
+                self.special_tokens_bytes, key=lambda x: len(x), reverse=True
+            )
             # Escape special characters in tokens for regex
-            escaped_tokens = [re.escape(token.decode("utf-8")) for token in self.special_tokens_bytes]
+            escaped_tokens = [re.escape(token.decode("utf-8")) for token in sorted_tokens]
             pattern = "(" + "|".join(escaped_tokens) + ")"
             self.special_tokens_pattern = re.compile(pattern)
         else:
